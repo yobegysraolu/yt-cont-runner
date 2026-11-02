@@ -1,4 +1,4 @@
-name: yt-cont-fetch2
+name: yt-cont-fetch3
 on:
   workflow_dispatch:
   push:
@@ -9,18 +9,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Fetch YouTube playlist continuation (v2)
+      - name: Inspect playlist with show-unavailable params (v3)
         shell: bash
         run: |
           python3 - <<'PY'
           import json, re, urllib.request, urllib.error
           PL = "PLyzTA8cetPdHtlGw1X8Kt7Ea4bd27ApR7"
           UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-          def get(url):
-              req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
-              with urllib.request.urlopen(req, timeout=40) as r:
-                  return r.read().decode("utf-8", "ignore")
 
           def post_raw(url, obj):
               req = urllib.request.Request(url, data=json.dumps(obj).encode("utf-8"),
@@ -31,108 +26,87 @@ jobs:
               except urllib.error.HTTPError as e:
                   return e.code, e.read().decode("utf-8", "ignore")
 
-          def title_of(d):
-              if not isinstance(d, dict): return None
-              t = d.get("title")
+          def get(url):
+              req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
+              with urllib.request.urlopen(req, timeout=40) as r:
+                  return r.read().decode("utf-8", "ignore")
+
+          def guess_title(o):
+              md = (o.get("lockupMetadataViewModel") or {})
+              if isinstance(md, dict) and md.get("title", {}).get("content"):
+                  return md["title"]["content"]
+              t = o.get("title")
               if isinstance(t, dict):
                   if t.get("simpleText"): return t["simpleText"]
-                  runs = t.get("runs")
-                  if isinstance(runs, list) and runs and runs[0].get("text"): return runs[0]["text"]
-                  acc = t.get("accessibility", {}).get("accessibilityData", {}).get("label")
-                  if acc: return acc
-              if d.get("headline"): return d["headline"]
-              label = d.get("accessibility", {}).get("accessibilityData", {}).get("label")
-              return label
+                  if t.get("runs") and t["runs"][0].get("text"): return t["runs"][0]["text"]
+              return o.get("headline") or o.get("accessibility", {}).get("accessibilityData", {}).get("label")
 
-          def walk(o, rows, toks, rkeys, depth=0):
-              if depth > 120: return
+          def walk(o, rows, anyv, rkeys, depth=0):
+              if depth > 140: return
               if isinstance(o, dict):
                   for k, v in o.items():
                       if isinstance(v, dict) and (k.endswith("Renderer") or k.endswith("ViewModel")):
                           rkeys[k] = rkeys.get(k, 0) + 1
                   if isinstance(o.get("lockupViewModel"), dict):
                       l = o["lockupViewModel"]
-                      cid = l.get("contentId")
-                      md = l.get("metadata", {}).get("lockupMetadataViewModel", {})
-                      t = md.get("title", {}).get("content")
-                      if cid and t: rows.append((cid, t))
-                  if isinstance(o.get("playlistVideoRenderer"), dict):
-                      p = o["playlistVideoRenderer"]
-                      vid = p.get("videoId"); t = title_of(p)
-                      if vid and t: rows.append((vid, t))
-                  if isinstance(o.get("playlistPanelVideoRenderer"), dict):
-                      p = o["playlistPanelVideoRenderer"]
-                      vid = p.get("videoId"); t = title_of(p)
-                      if vid and t: rows.append((vid, t))
+                      t = l.get("metadata", {}).get("lockupMetadataViewModel", {}).get("title", {}).get("content")
+                      if l.get("contentId") and t: rows.append((l["contentId"], t))
+                  for rk in ("playlistVideoRenderer", "playlistPanelVideoRenderer"):
+                      if isinstance(o.get(rk), dict):
+                          p = o[rk]
+                          vid = p.get("videoId"); t = guess_title(p)
+                          if vid and t: rows.append((vid, t))
                   vid = o.get("videoId")
-                  if isinstance(vid, str) and isinstance(o.get("title"), dict) and isinstance(o["title"].get("runs"), list):
-                      t = o["title"]["runs"][0].get("text")
-                      if t and (vid, t) not in rows: rows.append((vid, t))
-                  cc = o.get("continuationCommand")
-                  if isinstance(cc, dict) and isinstance(cc.get("token"), str):
-                      toks.append(cc["token"])
-                  for v in o.values(): walk(v, rows, toks, rkeys, depth+1)
+                  if isinstance(vid, str) and len(vid) == 11:
+                      if vid not in [a[0] for a in anyv]:
+                          anyv.append((vid, guess_title(o) or ""))
+                  for v in o.values(): walk(v, rows, anyv, rkeys, depth+1)
               elif isinstance(o, list):
-                  for v in o: walk(v, rows, toks, rkeys, depth+1)
+                  for v in o: walk(v, rows, anyv, rkeys, depth+1)
 
           html = get(f"https://www.youtube.com/playlist?list={PL}&hl=en&gl=US")
           mkey = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', html)
           KEY = mkey.group(1) if mkey else "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
           mver = re.search(r'"INNERTUBE_CLIENT_VERSION":"([^"]+)"', html)
           VER = mver.group(1) if mver else "2.20261029.11.00"
-          print("BOOT VER", VER, flush=True)
-
-          rows, toks0, rkeys0 = [], [], {}
           m = re.search(r"var ytInitialData = (\{.*?\})\s*;</script>", html, re.S)
           d0 = json.loads(m.group(1))
-          walk(d0, rows, toks0, rkeys0)
-          print("INIT VIDEOS", len(rows), "TOKS", len(toks0), flush=True)
-          print("INIT_RENDERER_KEYS", json.dumps(rkeys0, sort_keys=True)[:1500], flush=True)
+          rows0, any0, keys0 = [], [], {}
+          walk(d0, rows0, any0, keys0)
+          print("INIT rows:", len(rows0), "anyVideoIds:", len(any0), flush=True)
 
           ctx = {"client": {"clientName": "WEB", "clientVersion": VER, "hl": "en", "gl": "US"}}
-          queue, visited = [], set()
-          for t in toks0:
-              t = t.replace("%3D", "=")
-              if t not in queue: queue.append(t)
+          url = f"https://www.youtube.com/youtubei/v1/browse?key={KEY}&prettyPrint=false"
 
-          page = 0
-          while queue and page < 6:
-              tok = queue.pop(0)
-              if tok in visited: continue
-              visited.add(tok)
-              page += 1
-              print("PAGE", page, "TOKLEN", len(tok), "HEAD", tok[:36], flush=True)
-              status, body = post_raw(f"https://www.youtube.com/youtubei/v1/browse?key={KEY}&prettyPrint=false",
-                                      {"context": ctx, "continuation": tok})
-              print("HTTP_STATUS", status, "BODYLEN", len(body), flush=True)
-              if status != 200:
-                  print("ERR_BODY", body[:1200], flush=True)
-                  continue
-              try:
-                  d = json.loads(body)
-              except Exception as e:
-                  print("JSON_ERR", repr(e), body[:1200], flush=True)
-                  continue
-              add, mt, rk = [], [], {}
-              walk(d, add, mt, rk)
-              print("PAGE_RENDERER_KEYS", json.dumps(rk, sort_keys=True)[:1800], flush=True)
-              n0 = len(rows)
-              for item in add:
-                  if item not in rows: rows.append(item)
-              print("PAGE_ADD", len(rows)-n0, "TOTAL", len(rows), "NEWTOKS", len(mt), flush=True)
-              if page == 1:
-                  print("RAW_DUMP", body[:2200], flush=True)
-              for t in mt:
-                  t = t.replace("%3D", "=")
-                  if t not in visited and t not in queue: queue.append(t)
+          print("=== BROWSE with params=wgYCCAA= (show unavailable) ===", flush=True)
+          st, body = post_raw(url, {"context": ctx, "browseId": "VL" + PL, "params": "wgYCCAA="})
+          print("HTTP", st, "LEN", len(body), flush=True)
+          try:
+              d1 = json.loads(body)
+          except Exception as e:
+              print("JSON ERR", repr(e), body[:800], flush=True); d1 = {}
+          rows1, any1, keys1 = [], [], {}
+          walk(d1, rows1, any1, keys1)
+          print("RESP rows:", len(rows1), "anyVideoIds:", len(any1), flush=True)
+          print("RESP_KEYS", json.dumps(keys1, sort_keys=True)[:2000], flush=True)
 
-          print("===RESULTS===", flush=True)
-          seen = set(); uniq = []
-          for cid, t in rows:
-              if cid not in seen:
-                  seen.add(cid); uniq.append((cid, t))
-          for i, (cid, t) in enumerate(uniq, 1):
-              print(f"VIDEO|{i}|{cid}|{t}", flush=True)
-          print("TOTAL_COUNT", len(uniq), flush=True)
+          known = set(v for v, _ in any0) | set(v for v, _ in rows0)
+          print("--- ALL videoIds from params response ---", flush=True)
+          for vid, t in any1:
+              mark = "NEW" if vid not in known else "   "
+              print(f"ID|{mark}|{vid}|{t}", flush=True)
+          newrows = [(v, t) for v, t in rows1 if v not in known]
+          print("--- NEW titled rows ---", flush=True)
+          for v, t in newrows:
+              print(f"NEW|{v}|{t}", flush=True)
+
+          print("=== ALSO BROWSE plain browseId (control) ===", flush=True)
+          st2, body2 = post_raw(url, {"context": ctx, "browseId": "VL" + PL})
+          d2 = json.loads(body2) if st2 == 200 else {}
+          rows2, any2, keys2 = [], [], {}
+          walk(d2, rows2, any2, keys2)
+          print("PLAIN rows:", len(rows2), "anyVideoIds:", len(any2), "HTTP", st2, flush=True)
+          only_plain = [v for v, _ in any2 if v not in known]
+          print("PLAIN-only ids:", only_plain, flush=True)
           print("===END===", flush=True)
           PY
