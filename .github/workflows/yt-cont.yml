@@ -1,0 +1,111 @@
+name: yt-cont-fetch
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+    paths: [ '.github/workflows/yt-cont.yml' ]
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch YouTube playlist videos (incl. continuation pages)
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, re, urllib.request
+          PL = "PLyzTA8cetPdHtlGw1X8Kt7Ea4bd27ApR7"
+          UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+          def get(url):
+              req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
+              with urllib.request.urlopen(req, timeout=40) as r:
+                  return r.read().decode("utf-8", "ignore")
+
+          def post(url, obj):
+              req = urllib.request.Request(url, data=json.dumps(obj).encode("utf-8"),
+                  headers={"User-Agent": UA, "Content-Type": "application/json", "Accept-Language": "en-US,en;q=0.9"})
+              with urllib.request.urlopen(req, timeout=40) as r:
+                  return json.loads(r.read().decode("utf-8", "ignore"))
+
+          html = get(f"https://www.youtube.com/playlist?list={PL}&hl=en&gl=US")
+          mkey = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', html)
+          KEY = mkey.group(1) if mkey else "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+          mver = re.search(r'"INNERTUBE_CLIENT_VERSION":"([^"]+)"', html)
+          VER = mver.group(1) if mver else "2.20261029.11.00"
+          print("BOOT KEY_OK", bool(mkey), "VER", VER, flush=True)
+
+          def extract_videos(o, rows, depth=0):
+              if depth > 90: return
+              if isinstance(o, dict):
+                  if isinstance(o.get("lockupViewModel"), dict):
+                      l = o["lockupViewModel"]
+                      cid = l.get("contentId")
+                      md = l.get("metadata", {}).get("lockupMetadataViewModel", {})
+                      t = md.get("title", {}).get("content")
+                      if cid and t: rows.append((cid, t))
+                  if isinstance(o.get("playlistPanelVideoRenderer"), dict):
+                      p = o["playlistPanelVideoRenderer"]
+                      vid = p.get("videoId")
+                      t = p.get("title", {}).get("simpleText") or p.get("title", {}).get("accessibility", {}).get("accessibilityData", {}).get("label")
+                      if vid and t: rows.append((vid, t))
+                  for v in o.values(): extract_videos(v, rows, depth+1)
+              elif isinstance(o, list):
+                  for v in o: extract_videos(v, rows, depth+1)
+
+          def extract_conts(o, toks, depth=0):
+              if depth > 90: return
+              if isinstance(o, dict):
+                  cc = o.get("continuationCommand")
+                  if isinstance(cc, dict) and isinstance(cc.get("token"), str):
+                      toks.append(cc["token"])
+                  for v in o.values(): extract_conts(v, toks, depth+1)
+              elif isinstance(o, list):
+                  for v in o: extract_conts(v, toks, depth+1)
+
+          rows, toks = [], []
+          m = re.search(r"var ytInitialData = (\{.*?\})\s*;</script>", html, re.S)
+          if m:
+              try:
+                  d0 = json.loads(m.group(1))
+                  extract_videos(d0, rows); extract_conts(d0, toks)
+                  print("PARSE_OK VIDEOS", len(rows), "TOKS", len(toks), flush=True)
+              except Exception as e:
+                  print("PARSE_ERR", repr(e), flush=True)
+          else:
+              print("NO_INITIAL_DATA", flush=True)
+
+          ctx = {"client": {"clientName": "WEB", "clientVersion": VER, "hl": "en", "gl": "US"}}
+          queue, visited = [], set()
+          for t in toks:
+              t = t.replace("%3D", "=")
+              if t not in queue: queue.append(t)
+
+          for page in range(6):
+              if not queue: break
+              tok = queue.pop(0)
+              if tok in visited: continue
+              visited.add(tok)
+              print("BROWSE_PAGE", page, "QLEN", len(queue), flush=True)
+              try:
+                  d = post(f"https://www.youtube.com/youtubei/v1/browse?key={KEY}&prettyPrint=false",
+                          {"context": ctx, "continuation": tok})
+                  n0 = len(rows); extract_videos(d, rows); add = len(rows)-n0
+                  more = []; extract_conts(d, more)
+                  for t in more:
+                      t = t.replace("%3D", "=")
+                      if t not in visited and t not in queue: queue.append(t)
+                  print("PAGE_ADD", add, "TOTAL", len(rows), "MORE_TOKS", len(more), flush=True)
+              except Exception as e:
+                  print("POST_ERR", repr(e), flush=True)
+
+          seen, uniq = set(), []
+          for cid, t in rows:
+              if cid not in seen:
+                  seen.add(cid); uniq.append((cid, t))
+          print("===RESULTS===", flush=True)
+          for i, (cid, t) in enumerate(uniq, 1):
+              print(f"VIDEO|{i}|{cid}|{t}", flush=True)
+          print("TOTAL_COUNT", len(uniq), flush=True)
+          print("===END===", flush=True)
+          PY
